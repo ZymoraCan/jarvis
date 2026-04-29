@@ -35,6 +35,7 @@ except ImportError:
 
 from google import genai
 from google.genai import types as gtypes
+from config import get_model_type
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -90,6 +91,55 @@ _SYSTEM_PROMPT = (
     "Always call the appropriate tool; never simulate results."
 )
 
+_SCREEN_ANALYSIS_DEFAULT = {
+    "active_app_guess": "",
+    "visible_page_or_screen": "",
+    "visible_text_summary": "",
+    "possible_input_fields": [],
+    "possible_buttons": [],
+    "risk_level": "unknown",
+    "can_continue_current_task": False,
+    "reason": "",
+}
+
+
+def _is_quota_error(exc: Exception | str) -> bool:
+    text = str(exc).lower()
+    return "429" in text or "resource_exhausted" in text or "quota" in text or "rate limit" in text
+
+
+def _save_screen_analysis_to_state(analysis: dict) -> None:
+    try:
+        from session_state import screen_context_confidence, update_task_state
+
+        confidence = screen_context_confidence(analysis=analysis)
+        unavailable = (
+            not analysis.get("active_app_guess")
+            and not analysis.get("possible_buttons")
+            and not analysis.get("possible_input_fields")
+            and str(analysis.get("risk_level", "")).lower() == "unknown"
+            and not bool(analysis.get("can_continue_current_task", False))
+        )
+        updates = {
+            "last_screen_analysis_time": time.time(),
+            "last_screen_risk_level": analysis.get("risk_level", ""),
+            "last_screen_can_continue": analysis.get("can_continue_current_task", ""),
+            "last_screen_confidence": confidence.get("confidence", ""),
+            "last_context_conflict": confidence.get("reason", "") if confidence.get("confidence") == "conflict" else "",
+        }
+        if confidence.get("confidence") in {"high", "medium"} and not unavailable:
+            updates.update({
+                "last_vision_app_guess": analysis.get("active_app_guess", ""),
+                "last_visible_page_or_screen": analysis.get("visible_page_or_screen", ""),
+                "last_screen_summary": analysis.get("visible_text_summary", ""),
+                "last_visible_buttons": analysis.get("possible_buttons", []),
+                "last_visible_input_fields": analysis.get("possible_input_fields", []),
+            })
+
+        update_task_state(**updates)
+    except Exception as exc:
+        print(f"[Vision] Could not save screen analysis to session state: {exc}")
+
 
 def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]:
     if not _PIL:
@@ -117,6 +167,82 @@ def _capture_screen() -> tuple[bytes, str]:
         png      = mss.tools.to_png(shot.rgb, shot.size)
 
     return _compress(png, "PNG")
+
+
+def _extract_json_object(text: str) -> dict:
+    text = (text or "").strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except Exception:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+    raise ValueError("Gemini Vision did not return valid JSON.")
+
+
+def analyze_screen_once(question: str = "") -> dict:
+    result = dict(_SCREEN_ANALYSIS_DEFAULT)
+
+    if get_model_type() != "gemini":
+        result["reason"] = "Gemini mode is not active."
+        _save_screen_analysis_to_state(result)
+        return result
+
+    api_key = _load_config().get("gemini_api_key", "").strip()
+    if not api_key:
+        result["reason"] = "Gemini API key is not configured."
+        _save_screen_analysis_to_state(result)
+        return result
+
+    try:
+        image_bytes, mime_type = _capture_screen()
+        client = genai.Client(api_key=api_key)
+        prompt = (
+            "Analyze this desktop screenshot for safe UI automation. "
+            "Return ONLY one compact JSON object with exactly these keys: "
+            "active_app_guess, visible_page_or_screen, visible_text_summary, "
+            "possible_input_fields, possible_buttons, risk_level, "
+            "can_continue_current_task, reason. "
+            "possible_input_fields and possible_buttons must be arrays of short strings. "
+            "risk_level must be one of: low, medium, high, critical, unknown. "
+            "Set can_continue_current_task false when the target is unclear, a send/submit/payment/password/account action is visible, "
+            "or the screenshot does not provide enough confidence. "
+            "Do not include coordinates. Do not invent hidden UI. "
+        )
+        if question:
+            prompt += f" User context: {question[:500]}"
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=[
+                gtypes.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                prompt,
+            ],
+        )
+        parsed = _extract_json_object(response.text or "")
+        result.update({
+            "active_app_guess": str(parsed.get("active_app_guess", ""))[:120],
+            "visible_page_or_screen": str(parsed.get("visible_page_or_screen", ""))[:180],
+            "visible_text_summary": str(parsed.get("visible_text_summary", ""))[:500],
+            "possible_input_fields": list(parsed.get("possible_input_fields") or [])[:12],
+            "possible_buttons": list(parsed.get("possible_buttons") or [])[:16],
+            "risk_level": str(parsed.get("risk_level", "unknown")).lower()[:20],
+            "can_continue_current_task": bool(parsed.get("can_continue_current_task", False)),
+            "reason": str(parsed.get("reason", ""))[:300],
+        })
+        _save_screen_analysis_to_state(result)
+        return result
+    except Exception as exc:
+        if _is_quota_error(exc):
+            result["visible_text_summary"] = "Gemini Vision şu an kullanılamıyor: quota/limit dolu."
+            result["reason"] = "Gemini quota/limit dolu; güvenli title/process/session fallback kullanılmalı."
+        else:
+            result["visible_text_summary"] = "Screen analysis could not be completed."
+            result["reason"] = str(exc)[:300]
+        _save_screen_analysis_to_state(result)
+        return result
 
 
 def _cv2_backend() -> int:
@@ -391,6 +517,14 @@ def screen_process(
     params    = parameters or {}
     user_text = (params.get("text") or params.get("user_text") or "").strip()
     angle     = params.get("angle", "screen").lower().strip()
+
+    if get_model_type() != "gemini":
+        print("[Vision] Local mode active; Gemini vision call skipped.")
+        return False
+
+    if not _load_config().get("gemini_api_key", "").strip():
+        print("[Vision] Gemini API key is not configured; vision call skipped.")
+        return False
 
     if not user_text:
         print("[Vision] ⚠️  No question provided — aborting")

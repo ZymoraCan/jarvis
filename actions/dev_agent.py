@@ -4,6 +4,8 @@ import json
 import re
 import time
 from pathlib import Path
+from openai import OpenAI
+from config import get_ollama_endpoint, get_ollama_model, is_safe_mode
 
 
 def get_base_dir():
@@ -16,18 +18,35 @@ BASE_DIR         = get_base_dir()
 API_CONFIG_PATH  = BASE_DIR / "config" / "api_keys.json"
 PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
-MODEL_PLANNER    = "gemini-2.5-flash"
-MODEL_WRITER     = "gemini-2.5-flash"
-
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
 
 
-def _get_model(model_name: str):
-    import google.generativeai as genai
-    genai.configure(api_key=_get_api_key())
-    return genai.GenerativeModel(model_name)
+def _get_ollama_client():
+    return OpenAI(
+        api_key="not-needed",
+        base_url=get_ollama_endpoint()
+    )
+
+
+def _get_model():
+    return get_ollama_model()
+
+
+def _query_model(prompt: str, system_instruction: str = "") -> str:
+    """Query local model and return response text"""
+    client = _get_ollama_client()
+    model = _get_model()
+    
+    messages = []
+    if system_instruction:
+        messages.append({"role": "system", "content": system_instruction})
+    messages.append({"role": "user", "content": prompt})
+    
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.7
+    )
+    return response.choices[0].message.content
 
 
 def _strip_fences(text: str) -> str:
@@ -135,8 +154,8 @@ Critical rules:
 JSON:"""
 
     try:
-        response = model.generate_content(prompt)
-        raw = _strip_fences(response.text)
+        response_text = _query_model(prompt)
+        raw = _strip_fences(response_text)
         return json.loads(raw)
     except json.JSONDecodeError as e:
         raise ValueError(f"Planner returned invalid JSON: {e}\nRaw: {response.text[:300]}")
@@ -214,8 +233,8 @@ General rules:
 Code for {file_path}:"""
 
     try:
-        response = model.generate_content(prompt)
-        code = _strip_fences(response.text)
+        response_text = _query_model(prompt)
+        code = _strip_fences(response_text)
 
         full_path = project_dir / file_path
         full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -412,8 +431,8 @@ Rules:
 Fixed code for {fix_path}:"""
 
         try:
-            response = model.generate_content(prompt)
-            fixed = _strip_fences(response.text)
+            response_text = _query_model(prompt)
+            fixed = _strip_fences(response_text)
 
             full_path = project_dir / fix_path
             full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -586,6 +605,10 @@ def dev_agent(
 
     if not description:
         return "Please describe the project you want me to build, sir."
+
+    confirmed = str(p.get("confirmed", "")).lower() in ("yes", "true", "1", "confirm")
+    if is_safe_mode() and not confirmed:
+        return "Safe mode: dev_agent writes files, installs packages, and runs commands. Confirm with confirmed=yes."
 
     return _build_project(
         description  = description,

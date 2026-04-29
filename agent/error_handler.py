@@ -3,6 +3,8 @@ import re
 import sys
 from pathlib import Path
 from enum import Enum
+from openai import OpenAI
+from config import get_ollama_endpoint, get_ollama_model
 
 
 def get_base_dir() -> Path:
@@ -13,6 +15,35 @@ def get_base_dir() -> Path:
 
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
+
+
+def _get_ollama_client():
+    return OpenAI(
+        api_key="not-needed",
+        base_url=get_ollama_endpoint()
+    )
+
+
+def _get_model():
+    return get_ollama_model()
+
+
+def _query_model(prompt: str, system_instruction: str = "") -> str:
+    """Query local model and return response text"""
+    client = _get_ollama_client()
+    model = _get_model()
+    
+    messages = []
+    if system_instruction:
+        messages.append({"role": "system", "content": system_instruction})
+    messages.append({"role": "user", "content": prompt})
+    
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.7
+    )
+    return response.choices[0].message.content
 
 
 class ErrorDecision(Enum):
@@ -78,8 +109,6 @@ def analyze_error(
             "user_message": str
         }
     """
-    import google.generativeai as genai
-
     if attempt >= max_attempts:
         print(f"[ErrorHandler] ⚠️ Max attempts reached for step {step.get('step')} — forcing replan")
         return {
@@ -89,12 +118,6 @@ def analyze_error(
             "max_retries":   0,
             "user_message":  "Trying a different approach, sir."
         }
-
-    genai.configure(api_key=_get_api_key())
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash-lite",
-        system_instruction=ERROR_ANALYST_PROMPT
-    )
 
     prompt = f"""Failed step:
 Tool: {step.get('tool')}
@@ -108,8 +131,7 @@ Error:
 Attempt number: {attempt}"""
 
     try:
-        response = model.generate_content(prompt)
-        text     = response.text.strip()
+        text = _query_model(prompt, system_instruction=ERROR_ANALYST_PROMPT)
         text     = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
 
         result = json.loads(text)
@@ -148,11 +170,6 @@ def generate_fix(step: dict, error: str, fix_suggestion: str) -> dict:
 
     Returns a modified step dict.
     """
-    import google.generativeai as genai
-
-    genai.configure(api_key=_get_api_key())
-    model = genai.GenerativeModel(model_name="gemini-2.0-flash")
-
     prompt = f"""A task step failed. Generate a replacement step.
 
 Original step:
@@ -167,8 +184,7 @@ Write a Python script that accomplishes the same goal differently.
 Return ONLY the Python code, no explanation."""
 
     try:
-        response = model.generate_content(prompt)
-        code = response.text.strip()
+        code = _query_model(prompt)
         code = re.sub(r"```(?:python)?", "", code).strip().rstrip("`").strip()
 
         return {

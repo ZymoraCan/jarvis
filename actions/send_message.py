@@ -3,6 +3,15 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from config import is_safe_mode
+from session_state import (
+    is_continuation_command,
+    screen_context_check,
+    screen_context_confidence,
+    should_reuse_current_screen,
+    update_task_state,
+    load_task_state,
+)
 
 try:
     import pyautogui
@@ -135,7 +144,8 @@ def _search_in_app(query: str) -> None:
     time.sleep(1.0)
 
 def _desktop_send(app_name: str, receiver: str, message: str) -> str:
-    if not _open_app(app_name):
+    reuse, _ = should_reuse_current_screen(app_name)
+    if not reuse and not _open_app(app_name):
         return f"Could not open {app_name}."
 
     time.sleep(1.0)
@@ -244,6 +254,21 @@ def send_message(
     receiver     = params.get("receiver", "").strip()
     message_text = params.get("message_text", "").strip()
     platform     = params.get("platform", "whatsapp").strip()
+    confirmed    = str(params.get("confirmed", "")).lower() in {"1", "true", "yes", "evet", "onaylı", "onayli"}
+    raw_text     = params.get("raw_text", "") or params.get("user_text", "")
+    state        = load_task_state()
+
+    previous_app = str(state.get("last_target_app", "")).lower()
+    previous_action = str(state.get("last_successful_action", "")).lower()
+    message_context = (
+        previous_app in {"whatsapp", "telegram", "signal", "discord", "messenger", "instagram"}
+        or "message" in previous_action
+    )
+
+    if not receiver and message_context and is_continuation_command(raw_text or message_text):
+        receiver = str(state.get("last_target_contact_or_page", "")).strip()
+    if not platform and message_context and state.get("last_target_app"):
+        platform = str(state.get("last_target_app"))
 
     if not receiver:
         return "Please specify a recipient."
@@ -251,6 +276,22 @@ def send_message(
         return "Please specify the message content."
     if not _PYAUTOGUI:
         return "PyAutoGUI is not installed — cannot control the desktop."
+    if is_safe_mode() and not confirmed:
+        update_task_state(
+            last_target_app=platform.lower(),
+            last_target_contact_or_page=receiver,
+            last_successful_action="message_confirmation_required",
+            last_screen_summary=screen_context_check(platform).get("screen_summary", ""),
+            current_task_context=f"Pending message to {receiver} via {platform}: {message_text}",
+        )
+        return (
+            f"Confirmation required before sending message to {receiver} via {platform}. "
+            "Repeat with confirmed=yes if you want me to send it."
+        )
+
+    confidence = screen_context_confidence(target_app=platform)
+    if not confidence.get("can_act_safely"):
+        return f"Ekran bağlamı net değil, mesaj gönderemiyorum: {confidence.get('reason')}"
 
     preview = message_text[:50] + ("…" if len(message_text) > 50 else "")
     print(f"[SendMessage] 📨 {platform} → {receiver}: {preview}")
@@ -258,8 +299,19 @@ def send_message(
         player.write_log(f"[msg] {platform} → {receiver}")
 
     try:
+        ctx = screen_context_check(platform)
         handler = _resolve_platform(platform)
         result  = handler(receiver, message_text)
+        if "sent" in result.lower():
+            update_task_state(
+                last_target_app=platform.lower(),
+                last_target_window_title=ctx.get("active_window_title", ""),
+                last_target_contact_or_page=receiver,
+                last_successful_action="send_message",
+                last_screen_summary=ctx.get("screen_summary", ""),
+                last_known_input_field="message box",
+                current_task_context=f"Messaging {receiver} via {platform}.",
+            )
     except Exception as e:
         result = f"Could not send message: {e}"
 

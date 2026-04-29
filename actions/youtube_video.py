@@ -24,6 +24,7 @@ except ImportError:
     _TRANSCRIPT_OK = False
 
 from config import get_os, is_windows, is_mac, is_linux
+from session_state import screen_context_check, should_reuse_current_screen, update_task_state
 
 
 def _get_base_dir() -> Path:
@@ -275,6 +276,11 @@ def _handle_play(parameters: dict, player) -> str:
     if player:
         player.write_log(f"[YouTube] Searching: {query}")
 
+    reuse, reason = should_reuse_current_screen("youtube", query)
+    current = screen_context_check("youtube", query)
+    if reuse and query.lower() in current.get("active_window_title", "").lower():
+        return f"YouTube already appears to be on this content. Reusing current screen. ({reason})"
+
     print(f"[YouTube] 🔍 Scraping first non-Shorts video for: {query}")
 
     video_url = _scrape_first_video_url(query)
@@ -420,8 +426,21 @@ def youtube_video(
 
     try:
         if action == "play":
-            return handler(params, player) or "Done."
-        return handler(params, player, speak) or "Done."
+            result = handler(params, player) or "Done."
+        else:
+            result = handler(params, player, speak) or "Done."
+        if action == "play":
+            time.sleep(1.0)
+        ctx = screen_context_check("youtube", params.get("query") or params.get("url") or action)
+        update_task_state(
+            last_target_app="youtube",
+            last_target_window_title=ctx.get("active_window_title", ""),
+            last_target_contact_or_page=params.get("query") or params.get("url") or "",
+            last_successful_action=f"youtube_video:{action}",
+            last_screen_summary=ctx.get("screen_summary", ""),
+            current_task_context=str(result)[:240],
+        )
+        return result
     except Exception as e:
         print(f"[YouTube] ❌ Error in {action}: {e}")
         return f"YouTube {action} failed, sir: {e}"

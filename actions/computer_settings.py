@@ -5,6 +5,8 @@ import time
 import subprocess
 import platform
 from pathlib import Path
+from openai import OpenAI
+from config import get_ollama_endpoint, get_ollama_model
 
 try:
     import pyautogui
@@ -27,6 +29,17 @@ def _get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent.parent
+
+
+def _get_ollama_client():
+    return OpenAI(
+        api_key="not-needed",
+        base_url=get_ollama_endpoint()
+    )
+
+
+def _get_model():
+    return get_ollama_model()
 
 def _get_api_key() -> str:
     path = _get_base_dir() / "config" / "api_keys.json"
@@ -568,10 +581,8 @@ _DANGEROUS_ACTIONS = {"restart", "shutdown"}
 
 
 def _detect_action(description: str) -> dict:
-
-    import google.generativeai as genai
-    genai.configure(api_key=_get_api_key())
-    model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    client = _get_ollama_client()
+    model = _get_model()
 
     available = ", ".join(sorted(ACTION_MAP.keys())) + \
                 ", volume_set, type_text, press_key, reload_n"
@@ -595,8 +606,13 @@ Rules:
 - Return ONLY the JSON, no explanation, no markdown."""
 
     try:
-        resp = model.generate_content(prompt)
-        text = re.sub(r"```(?:json)?", "", resp.text).strip().rstrip("`").strip()
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7
+        )
+        text = response.choices[0].message.content
+        text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
         return json.loads(text)
     except Exception as e:
         print(f"[Settings] Intent detection failed: {e}")

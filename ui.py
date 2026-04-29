@@ -4,6 +4,7 @@ from collections import deque
 from PIL import Image, ImageTk, ImageDraw
 import sys
 from pathlib import Path
+from config import get_config, save_config
 
 
 def get_base_dir():
@@ -105,6 +106,7 @@ class JarvisUI:
         self._build_input_bar(LW, INPUT_Y)
 
         self._build_mute_button()
+        self._build_settings_button()
 
         self.root.bind("<F4>", lambda e: self._toggle_mute())
 
@@ -127,6 +129,20 @@ class JarvisUI:
         self._mute_canvas.place(x=BTN_X, y=BTN_Y)
         self._mute_canvas.bind("<Button-1>", lambda e: self._toggle_mute())
         self._draw_mute_button()
+
+    def _build_settings_button(self):
+        self._settings_btn = tk.Button(
+            self.root,
+            text="SETTINGS",
+            command=self._show_setup_ui,
+            fg=C_PRI, bg=C_PANEL,
+            activeforeground=C_BG, activebackground=C_PRI,
+            font=("Courier", 9, "bold"),
+            borderwidth=0, cursor="hand2",
+            highlightthickness=1,
+            highlightbackground=C_MID,
+        )
+        self._settings_btn.place(x=136, y=self.H - 70, width=92, height=32)
 
     def _draw_mute_button(self):
         c = self._mute_canvas
@@ -465,7 +481,7 @@ class JarvisUI:
         c.create_text(W - 16, H - 14, fill=C_DIM, font=("Courier", 8),
                       text="[F4] MUTE", anchor="e")
         c.create_text(W // 2, H - 14, fill=C_DIM, font=("Courier", 8),
-                      text="FatihMakes Industries  ·  CLASSIFIED  ·  MARK XXXVII")
+                      text="Zymora Industries  ·  CLASSIFIED  ·  MARK XXXVII")
 
     def write_log(self, text: str):
         self.typing_queue.append(text)
@@ -515,11 +531,12 @@ class JarvisUI:
             self.set_state("LISTENING")
 
     def _api_keys_exist(self) -> bool:
-        if not API_FILE.exists():
-            return False
         try:
-            data = json.loads(API_FILE.read_text(encoding="utf-8"))
-            return bool(data.get("gemini_api_key")) and bool(data.get("os_system"))
+            data = get_config()
+            model_type = str(data.get("model_type", "gemini")).lower()
+            if model_type == "gemini":
+                return bool(data.get("gemini_api_key")) and bool(data.get("os_system"))
+            return bool(data.get("local_endpoint")) and bool(data.get("local_model"))
         except Exception:
             return False
 
@@ -686,3 +703,161 @@ class JarvisUI:
         self._api_key_ready = True
         self.set_state("LISTENING")
         self.write_log(f"SYS: Systems initialised. OS → {os_system.upper()}. JARVIS online.")
+    # Settings methods below intentionally override the legacy setup methods above.
+    def _select_model_type(self, model_type: str):
+        self._selected_model_type.set(model_type)
+        for key, btn in getattr(self, "_model_buttons", {}).items():
+            if key == model_type:
+                btn.configure(
+                    fg=C_BG, bg=C_PRI,
+                    activeforeground=C_BG, activebackground=C_PRI,
+                    relief="flat",
+                )
+            else:
+                btn.configure(
+                    fg=C_DIM, bg="#000d12",
+                    activeforeground=C_TEXT, activebackground="#001a22",
+                    relief="flat",
+                )
+
+    def _show_setup_ui(self):
+        if hasattr(self, "setup_frame") and self.setup_frame.winfo_exists():
+            self.setup_frame.destroy()
+
+        cfg = get_config()
+        detected = cfg.get("os_system") or self._detect_os()
+        self._selected_os = tk.StringVar(value=detected)
+        self._selected_model_type = tk.StringVar(value=cfg.get("model_type", "gemini"))
+        self._web_agent_var = tk.BooleanVar(value=bool(cfg.get("web_agent_enabled", True)))
+        self._safe_mode_var = tk.BooleanVar(value=bool(cfg.get("safe_mode", True)))
+
+        self.setup_frame = tk.Frame(
+            self.root, bg="#00080d",
+            highlightbackground=C_PRI, highlightthickness=1,
+        )
+        self.setup_frame.place(relx=0.5, rely=0.5, anchor="center")
+
+        tk.Label(
+            self.setup_frame,
+            text="SYSTEM SETTINGS",
+            fg=C_PRI, bg="#00080d",
+            font=("Courier", 13, "bold"),
+        ).pack(pady=(14, 2))
+
+        body = tk.Frame(self.setup_frame, bg="#00080d")
+        body.pack(padx=24, pady=10)
+
+        def row(label, value="", secret=False):
+            r = tk.Frame(body, bg="#00080d")
+            r.pack(fill="x", pady=3)
+            tk.Label(
+                r, text=label, fg=C_DIM, bg="#00080d",
+                width=18, anchor="w", font=("Courier", 9),
+            ).pack(side="left")
+            entry = tk.Entry(
+                r, width=58, fg=C_TEXT, bg="#000d12",
+                insertbackground=C_TEXT, borderwidth=0,
+                font=("Courier", 9), show="*" if secret else "",
+            )
+            entry.insert(0, value or "")
+            entry.pack(side="left")
+            return entry
+
+        model_frame = tk.Frame(body, bg="#00080d")
+        model_frame.pack(fill="x", pady=(3, 8))
+        tk.Label(
+            model_frame, text="MODEL TYPE", fg=C_DIM, bg="#00080d",
+            width=18, anchor="w", font=("Courier", 9),
+        ).pack(side="left")
+        self._model_buttons = {}
+        for key in ("gemini", "local"):
+            btn = tk.Button(
+                model_frame, text=key.upper(), width=10,
+                font=("Courier", 9, "bold"), borderwidth=0,
+                cursor="hand2", command=lambda k=key: self._select_model_type(k),
+            )
+            btn.pack(side="left", padx=4)
+            self._model_buttons[key] = btn
+
+        self._endpoint_entry = row("LOCAL ENDPOINT", cfg.get("local_endpoint", ""))
+        self._model_entry = row("LOCAL MODEL", cfg.get("local_model", ""))
+        self._model_path_entry = row("MODEL PATH", cfg.get("model_path", ""))
+        self.gemini_entry = row("GEMINI KEY", cfg.get("gemini_api_key", ""), secret=True)
+        self._python_entry = row("PYTHON PATH", cfg.get("python_path", ""))
+        self._mic_entry = row("MIC DEVICE", cfg.get("microphone_device", ""))
+
+        os_frame = tk.Frame(body, bg="#00080d")
+        os_frame.pack(fill="x", pady=(8, 8))
+        tk.Label(
+            os_frame, text="OPERATING SYSTEM", fg=C_DIM, bg="#00080d",
+            width=18, anchor="w", font=("Courier", 9),
+        ).pack(side="left")
+        self._os_buttons = {}
+        for os_key, os_label in (("windows", "WINDOWS"), ("mac", "MACOS"), ("linux", "LINUX")):
+            btn = tk.Button(
+                os_frame, text=os_label, width=10,
+                font=("Courier", 9, "bold"), borderwidth=0,
+                cursor="hand2", command=lambda k=os_key: self._select_os(k),
+            )
+            btn.pack(side="left", padx=4)
+            self._os_buttons[os_key] = btn
+
+        flags = tk.Frame(body, bg="#00080d")
+        flags.pack(fill="x", pady=(6, 2))
+        tk.Checkbutton(
+            flags, text="WEB AGENT", variable=self._web_agent_var,
+            fg=C_TEXT, bg="#00080d", selectcolor=C_BG,
+            activebackground="#00080d", font=("Courier", 9),
+        ).pack(side="left", padx=(0, 18))
+        tk.Checkbutton(
+            flags, text="SAFE MODE", variable=self._safe_mode_var,
+            fg=C_TEXT, bg="#00080d", selectcolor=C_BG,
+            activebackground="#00080d", font=("Courier", 9),
+        ).pack(side="left")
+
+        actions = tk.Frame(self.setup_frame, bg="#00080d")
+        actions.pack(pady=(4, 14))
+        tk.Button(
+            actions, text="SAVE", command=self._save_api_keys,
+            bg=C_BG, fg=C_PRI, activebackground="#003344",
+            font=("Courier", 10, "bold"), borderwidth=0, padx=20, pady=8,
+        ).pack(side="left", padx=6)
+        tk.Button(
+            actions, text="CLOSE", command=self.setup_frame.destroy,
+            bg=C_PANEL, fg=C_DIM, activebackground="#001a22",
+            font=("Courier", 10), borderwidth=0, padx=18, pady=8,
+        ).pack(side="left", padx=6)
+
+        self._select_os(detected)
+        self._select_model_type(self._selected_model_type.get())
+
+    def _save_api_keys(self):
+        model_type = self._selected_model_type.get()
+        gemini = self.gemini_entry.get().strip()
+        if model_type == "gemini" and not gemini:
+            self.gemini_entry.configure(
+                highlightthickness=1,
+                highlightbackground=C_RED,
+                highlightcolor=C_RED,
+            )
+            return
+
+        cfg = get_config()
+        cfg.update({
+            "os_system": self._selected_os.get(),
+            "model_type": model_type,
+            "local_endpoint": self._endpoint_entry.get().strip(),
+            "local_model": self._model_entry.get().strip(),
+            "model_path": self._model_path_entry.get().strip(),
+            "gemini_api_key": gemini,
+            "python_path": self._python_entry.get().strip(),
+            "microphone_device": self._mic_entry.get().strip(),
+            "web_agent_enabled": bool(self._web_agent_var.get()),
+            "safe_mode": bool(self._safe_mode_var.get()),
+        })
+        save_config(cfg)
+
+        self.setup_frame.destroy()
+        self._api_key_ready = True
+        self.set_state("LISTENING")
+        self.write_log(f"SYS: Settings saved. Mode -> {model_type.upper()}.")

@@ -2,6 +2,8 @@ import time
 import subprocess
 import platform
 import shutil
+from session_state import screen_context_check, should_reuse_current_screen, update_task_state
+from config import get_default_browser
 
 try:
     import psutil
@@ -231,12 +233,27 @@ def open_app(
 
     if not app_name:
         return "No application name provided."
+    if app_name.lower() in {"browser", "tarayıcı", "tarayici", "web browser"}:
+        app_name = get_default_browser()
 
     launcher = _OS_LAUNCHERS.get(_SYSTEM)
     if launcher is None:
         return f"Unsupported operating system: {_SYSTEM}"
 
     normalized = _normalize(app_name)
+    if normalized.lower() == "chrome" and _SYSTEM == "Windows" and not shutil.which("chrome"):
+        return "Chrome bu sistemde bulunamadı. Varsayılan tarayıcı Brave olarak ayarlı."
+    ctx = screen_context_check(target_app=app_name)
+    reuse, reason = should_reuse_current_screen(app_name)
+    if reuse:
+        update_task_state(
+            last_target_app=app_name.lower(),
+            last_target_window_title=ctx.get("active_window_title", ""),
+            last_successful_action="open_app_reused_current_screen",
+            last_screen_summary=ctx.get("screen_summary", ""),
+            current_task_context=f"{app_name} is already active; reused current screen.",
+        )
+        return f"{app_name} already appears to be open. Reusing current screen. ({reason})"
     print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
 
     if player:
@@ -244,9 +261,37 @@ def open_app(
 
     try:
         if launcher(normalized):
+            post_ctx = screen_context_check(target_app=app_name)
+            confirmed_open, _ = should_reuse_current_screen(app_name)
+            if not confirmed_open:
+                return (
+                    f"Could not confirm that {app_name} launched. "
+                    f"Active screen is: {post_ctx.get('screen_summary', 'unknown')}."
+                )
+            update_task_state(
+                last_target_app=app_name.lower(),
+                last_target_window_title=post_ctx.get("active_window_title", ""),
+                last_successful_action="open_app",
+                last_screen_summary=post_ctx.get("screen_summary", ""),
+                current_task_context=f"Opened {app_name}.",
+            )
             return f"Opened {app_name}."
         if normalized.lower() != app_name.lower():
             if launcher(app_name):
+                post_ctx = screen_context_check(target_app=app_name)
+                confirmed_open, _ = should_reuse_current_screen(app_name)
+                if not confirmed_open:
+                    return (
+                        f"Could not confirm that {app_name} launched. "
+                        f"Active screen is: {post_ctx.get('screen_summary', 'unknown')}."
+                    )
+                update_task_state(
+                    last_target_app=app_name.lower(),
+                    last_target_window_title=post_ctx.get("active_window_title", ""),
+                    last_successful_action="open_app",
+                    last_screen_summary=post_ctx.get("screen_summary", ""),
+                    current_task_context=f"Opened {app_name}.",
+                )
                 return f"Opened {app_name}."
         return (
             f"Could not confirm that {app_name} launched. "

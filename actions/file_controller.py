@@ -3,6 +3,8 @@ import shutil
 import platform
 from pathlib import Path
 from datetime import datetime
+from config import is_safe_mode
+from session_state import screen_context_check, update_task_state
 
 try:
     import send2trash
@@ -135,12 +137,14 @@ def list_files(path: str = "desktop", show_hidden: bool = False) -> str:
         return f"Error listing files: {e}"
 
 
-def create_file(path: str, name: str = "", content: str = "") -> str:
+def create_file(path: str, name: str = "", content: str = "", confirmed: bool = False) -> str:
     try:
         base   = _resolve_path(path)
         target = (base / name) if name else base
         if not _is_safe_path(target):
             return f"Access denied: {target}"
+        if is_safe_mode() and target.exists() and not confirmed:
+            return f"Safe mode: '{target.name}' already exists. Confirm overwrite with confirmed=yes."
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return f"File created: {target.name}"
@@ -160,7 +164,7 @@ def create_folder(path: str, name: str = "") -> str:
         return f"Could not create folder: {e}"
 
 
-def delete_file(path: str, name: str = "") -> str:
+def delete_file(path: str, name: str = "", confirmed: bool = False) -> str:
     try:
         base   = _resolve_path(path)
         target = (base / name) if name else base
@@ -168,6 +172,8 @@ def delete_file(path: str, name: str = "") -> str:
             return f"Access denied: {target}"
         if not target.exists():
             return f"Not found: {target.name}"
+        if is_safe_mode() and not confirmed:
+            return f"Safe mode: confirm deletion of '{target.name}' with confirmed=yes."
 
         # Güvenli dizin kontrolü — kritik kullanıcı klasörlerini koru
         protected = {
@@ -285,12 +291,14 @@ def read_file(path: str, name: str = "", max_chars: int = 4000) -> str:
 
 
 def write_file(path: str, name: str = "", content: str = "",
-               append: bool = False) -> str:
+               append: bool = False, confirmed: bool = False) -> str:
     try:
         base   = _resolve_path(path)
         target = (base / name) if name else base
         if not _is_safe_path(target):
             return f"Access denied: {target}"
+        if is_safe_mode() and target.exists() and not append and not confirmed:
+            return f"Safe mode: '{target.name}' exists. Confirm overwrite with confirmed=yes."
         target.parent.mkdir(parents=True, exist_ok=True)
         mode = "a" if append else "w"
         with open(target, mode, encoding="utf-8") as f:
@@ -483,38 +491,45 @@ def file_controller(
 
     try:
         if action == "list":
-            return list_files(path)
+            result = list_files(path)
 
         elif action == "create_file":
-            return create_file(path, name=name, content=params.get("content", ""))
+            result = create_file(
+                path, name=name, content=params.get("content", ""),
+                confirmed=str(params.get("confirmed", "")).lower() in ("yes", "true", "1", "confirm"),
+            )
 
         elif action == "create_folder":
-            return create_folder(path, name=name)
+            result = create_folder(path, name=name)
 
         elif action == "delete":
-            return delete_file(path, name=name)
+            result = delete_file(
+                path, name=name,
+                confirmed=str(params.get("confirmed", "")).lower() in ("yes", "true", "1", "confirm"),
+            )
 
         elif action == "move":
-            return move_file(path, name=name, destination=params.get("destination", ""))
+            result = move_file(path, name=name, destination=params.get("destination", ""))
 
         elif action == "copy":
-            return copy_file(path, name=name, destination=params.get("destination", ""))
+            result = copy_file(path, name=name, destination=params.get("destination", ""))
 
         elif action == "rename":
-            return rename_file(path, name=name, new_name=params.get("new_name", ""))
+            result = rename_file(path, name=name, new_name=params.get("new_name", ""))
 
         elif action == "read":
-            return read_file(path, name=name)
+            result = read_file(path, name=name)
 
         elif action == "write":
-            return write_file(
+            result = write_file(
                 path, name=name,
                 content=params.get("content", ""),
-                append=params.get("append", False)
+                append=params.get("append", False),
+                confirmed=str(params.get("confirmed", "")).lower() in ("yes", "true", "1", "confirm"),
             )
 
         elif action == "find":
-            return find_files(
+            result = find_files(
                 name=name or params.get("name", ""),
                 extension=params.get("extension", ""),
                 path=path,
@@ -522,22 +537,37 @@ def file_controller(
             )
 
         elif action == "largest":
-            return get_largest_files(
+            result = get_largest_files(
                 path=path,
                 count=int(params.get("count", 10)),
             )
 
         elif action == "disk_usage":
-            return get_disk_usage(path)
+            result = get_disk_usage(path)
 
         elif action == "organize_desktop":
-            return organize_desktop()
+            result = organize_desktop()
 
         elif action == "info":
-            return get_file_info(path, name=name)
+            result = get_file_info(path, name=name)
 
         else:
-            return f"Unknown action: '{action}'"
+            result = f"Unknown action: '{action}'"
+
+        ctx = screen_context_check("file explorer", path)
+        try:
+            target_title = str(_resolve_path(path))
+        except Exception:
+            target_title = ctx.get("active_window_title", "")
+        update_task_state(
+            last_target_app="file explorer",
+            last_target_window_title=target_title,
+            last_target_contact_or_page=str(path),
+            last_successful_action=f"file_controller:{action}",
+            last_screen_summary=ctx.get("screen_summary", ""),
+            current_task_context=str(result)[:240],
+        )
+        return result
 
     except Exception as e:
         return f"File controller error ({action}): {e}"

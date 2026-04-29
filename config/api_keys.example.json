@@ -1,0 +1,13 @@
+{
+  "os_system": "windows",
+  "model_type": "gemini",
+  "local_endpoint": "http://127.0.0.1:8000/v1/chat/completions",
+  "local_model": "Orion-zhen/Qwen2.5-14B-Instruct-Uncensored",
+  "model_path": "",
+  "gemini_api_key": "AIzaSyDUR7lYQhgGZ9-DjUdNk5VKY4mxccoX8ZU",
+  "python_path": "",
+  "microphone_device": "",
+  "web_agent_enabled": true,
+  "safe_mode": true,
+  "default_browser": "brave"
+}

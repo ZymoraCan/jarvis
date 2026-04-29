@@ -9,6 +9,9 @@ from pathlib import Path
 import sounddevice as sd
 from google import genai
 from google.genai import types
+from config import get_config, get_model_type, get_gemini_key
+from doctor import run_doctor
+from session_state import continuation_context_for_prompt, format_screen_status, screen_context_check, update_task_state
 from ui import JarvisUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
@@ -31,6 +34,15 @@ from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
 
+# Ensure Windows console can print Unicode logs safely.
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -49,8 +61,10 @@ CHUNK_SIZE          = 1024
 
 
 def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    key = get_gemini_key()
+    if not key:
+        raise RuntimeError("Gemini API key is not configured. Open Settings and enter gemini_api_key.")
+    return key
 
 
 def _load_system_prompt() -> str:
@@ -88,7 +102,7 @@ TOOL_DECLARATIONS = [
             "properties": {
                 "app_name": {
                     "type": "STRING",
-                    "description": "Exact name of the application (e.g. 'WhatsApp', 'Chrome', 'Spotify')"
+                    "description": "Exact name of the application (e.g. 'WhatsApp', 'Brave', 'Spotify'). Use Brave for generic browser requests unless the user names another browser."
                 }
             },
             "required": ["app_name"]
@@ -127,7 +141,8 @@ TOOL_DECLARATIONS = [
             "properties": {
                 "receiver":     {"type": "STRING", "description": "Recipient contact name"},
                 "message_text": {"type": "STRING", "description": "The message to send"},
-                "platform":     {"type": "STRING", "description": "Platform: WhatsApp, Telegram, etc."}
+                "platform":     {"type": "STRING", "description": "Platform: WhatsApp, Telegram, etc."},
+                "confirmed":    {"type": "STRING", "description": "yes only after the user explicitly confirms sending"}
             },
             "required": ["receiver", "message_text", "platform"]
         }
@@ -204,8 +219,9 @@ TOOL_DECLARATIONS = [
         "description": (
             "Controls any web browser. Use for: opening websites, searching the web, "
             "clicking elements, filling forms, scrolling, screenshots, navigation, any web-based task. "
+            "Use Brave as the default browser when the user does not specify one. "
             "Always pass the 'browser' parameter when the user specifies a browser (e.g. 'open in Edge', "
-            "'use Firefox', 'open Chrome'). Multiple browsers can run simultaneously."
+            "'use Firefox', 'open Brave'). Multiple browsers can run simultaneously."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -375,6 +391,17 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "doctor",
+        "description": (
+            "Runs a local health check for JARVIS. "
+            "Use when the user says doctor, health check, diagnostics, or asks if the system is working."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {},
+        }
+    },
+    {
         "name": "shutdown_jarvis",
         "description": (
             "Shuts down the assistant completely. "
@@ -412,7 +439,7 @@ TOOL_DECLARATIONS = [
                     )
                 },
                 "key":   {"type": "STRING", "description": "Short snake_case key (e.g. name, favorite_food, sister_name)"},
-                "value": {"type": "STRING", "description": "Concise value in English (e.g. Fatih, pizza, older sister)"},
+                "value": {"type": "STRING", "description": "Concise value in English (e.g. Enes, pizza, older sister)"},
             },
             "required": ["category", "key", "value"]
         }
@@ -434,11 +461,19 @@ class JarvisLive:
         self._turn_done_event: asyncio.Event | None = None
 
     def _on_text_command(self, text: str):
-        if not self._loop or not self.session:
+        if text.strip().lower() in {"doctor", "doktor", "health", "health check"}:
+            self.ui.write_log(run_doctor())
             return
+        if text.strip().lower() in {"ekranda ne görüyorsun", "ekranda ne goruyorsun", "şu anda nerede olduğumu söyle", "su anda nerede oldugumu soyle"}:
+            self.ui.write_log(format_screen_status())
+            return
+        if not self._loop or not self.session:
+            self.ui.write_log("ERR: Gemini session is not connected yet. Check Settings/API key or run doctor.")
+            return
+        text_to_send = continuation_context_for_prompt(text)
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
+                turns={"parts": [{"text": text_to_send}]},
                 turn_complete=True
             ),
             self._loop
@@ -606,6 +641,9 @@ class JarvisLive:
                 r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
                 result = r or "Done."
 
+            elif name == "doctor":
+                result = await loop.run_in_executor(None, run_doctor)
+
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
                 self.speak("Goodbye, sir.")
@@ -622,6 +660,32 @@ class JarvisLive:
             result = f"Tool '{name}' failed: {e}"
             traceback.print_exc()
             self.speak_error(name, e)
+
+        if not str(result).lower().startswith(("tool '", "unknown tool")):
+            target_app = (
+                args.get("app_name")
+                or args.get("browser")
+                or args.get("platform")
+                or ("youtube" if name == "youtube_video" else "")
+                or ("file explorer" if name in ("file_controller", "desktop_control") else "")
+            )
+            target_page = (
+                args.get("receiver")
+                or args.get("query")
+                or args.get("url")
+                or args.get("path")
+                or args.get("description")
+                or ""
+            )
+            ctx = screen_context_check(str(target_app or ""), str(target_page or ""))
+            update_task_state(
+                last_target_app=str(target_app or ""),
+                last_target_window_title=ctx.get("active_window_title", ""),
+                last_target_contact_or_page=str(target_page or ""),
+                last_successful_action=name,
+                last_screen_summary=ctx.get("screen_summary", ""),
+                current_task_context=f"{name}: {str(result)[:240]}",
+            )
 
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
@@ -802,9 +866,18 @@ class JarvisLive:
 
 
 def main():
+    get_config()
     ui = JarvisUI("face.png")
 
     def runner():
+        model_type = get_model_type()
+        if model_type in ("local", "ollama"):
+            # Local mode uses OpenAI-compatible endpoint flow.
+            from jarvis_text import TextJarvis
+            ui.write_log("SYS: Local model mode active.")
+            TextJarvis(ui)
+            return
+
         ui.wait_for_api_key()
         jarvis = JarvisLive(ui)
         try:

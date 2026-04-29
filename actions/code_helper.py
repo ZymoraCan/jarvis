@@ -4,6 +4,9 @@ import json
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from openai import OpenAI
+from config import get_gemini_key, get_model_type, get_ollama_endpoint, get_ollama_model, is_safe_mode
 
 
 def get_base_dir():
@@ -15,18 +18,43 @@ BASE_DIR           = get_base_dir()
 API_CONFIG_PATH    = BASE_DIR / "config" / "api_keys.json"
 DESKTOP            = Path.home() / "Desktop"
 MAX_BUILD_ATTEMPTS = 3
-GEMINI_MODEL       = "gemini-2.5-flash"
+
+
+def _get_ollama_client():
+    return OpenAI(
+        api_key="not-needed",
+        base_url=get_ollama_endpoint()
+    )
+
+
+def _get_model():
+    return get_ollama_model()
+
+
+class _LocalTextModel:
+    def generate_content(self, prompt: str):
+        response = _get_ollama_client().chat.completions.create(
+            model=_get_model(),
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1200,
+        )
+        return SimpleNamespace(text=response.choices[0].message.content or "")
 
 
 def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    if get_model_type() != "gemini":
+        return ""
+    return get_gemini_key()
 
 
-def _get_gemini(model: str = GEMINI_MODEL):
-    import google.generativeai as genai
-    genai.configure(api_key=_get_api_key())
-    return genai.GenerativeModel(model)
+def _get_gemini():
+    if get_model_type() == "gemini" and get_gemini_key():
+        import google.generativeai as genai
+
+        genai.configure(api_key=get_gemini_key())
+        return genai.GenerativeModel("gemini-2.5-flash")
+    return _LocalTextModel()
 
 
 def _clean_code(text: str) -> str:
@@ -433,6 +461,13 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
     if not screenshot_path:
         return "Could not take screenshot, sir. Please make sure PyAutoGUI is installed."
 
+    if get_model_type() != "gemini" or not get_gemini_key():
+        try:
+            screenshot_path.unlink()
+        except Exception:
+            pass
+        return "Screen debug needs Gemini vision. Local mode is active, so no cloud API call was made."
+
 
     file_content = ""
     if file_path:
@@ -539,6 +574,10 @@ def code_helper(
     if action == "auto":
         action = _detect_intent(description, file_path, code)
         print(f"[Code] 🤖 Auto-detected: {action}")
+
+    confirmed = str(p.get("confirmed", "")).lower() in ("yes", "true", "1", "confirm")
+    if is_safe_mode() and action in {"write", "edit", "run", "build", "optimize"} and not confirmed:
+        return f"Safe mode: code action '{action}' requires confirmed=yes."
 
     if action == "write":
         return _write_action(description, language, output_path, player)

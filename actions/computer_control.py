@@ -7,6 +7,8 @@ import sys
 import time
 import random
 from pathlib import Path
+from config import get_model_type
+from session_state import safe_click_or_ask, screen_context_check, screen_context_confidence, update_task_state
 
 try:
     import pyautogui
@@ -296,6 +298,9 @@ def _focus_window(title: str) -> str:
     return f"focus_window: unknown OS '{os_name}'"
 
 def _screen_find(description: str) -> tuple[int, int] | None:
+    if get_model_type() != "gemini":
+        print("[ComputerControl] screen_find needs Gemini vision; local mode is active.")
+        return None
     api_key = _get_api_key()
     if not api_key:
         print("[ComputerControl] ⚠️ No API key for screen_find")
@@ -398,26 +403,45 @@ def computer_control(
     if player:
         player.write_log(f"[Computer] {action}")
 
+    ctx = screen_context_check(take_screenshot=action in {"screen_find", "screen_click", "screenshot"})
     print(f"[ComputerControl] ▶ {action}  {params}")
 
     try:
 
         if action == "type":
+            confirmed = str(params.get("confirmed", "")).lower() in {"yes", "true", "1", "confirm"}
+            if not confirmed and not (params.get("description") or params.get("title") or params.get("field")):
+                return "Yazma hedefi net değil. Hangi alan/pencere olduğunu belirt veya confirmed=yes ile onayla."
+            confidence = screen_context_confidence(target_app=ctx.get("target_app", ""))
+            if not confidence.get("can_act_safely"):
+                return f"Ekran bağlamı net değil, yazma işlemi yapamıyorum: {confidence.get('reason')}"
             return _type(params.get("text", ""))
 
         if action == "smart_type":
+            confirmed = str(params.get("confirmed", "")).lower() in {"yes", "true", "1", "confirm"}
+            if not confirmed and not (params.get("description") or params.get("title") or params.get("field")):
+                return "Yazma hedefi net değil. Hangi alan/pencere olduğunu belirt veya confirmed=yes ile onayla."
+            confidence = screen_context_confidence(target_app=ctx.get("target_app", ""))
+            if not confidence.get("can_act_safely"):
+                return f"Ekran bağlamı net değil, yazma işlemi yapamıyorum: {confidence.get('reason')}"
             return _smart_type(
                 params.get("text", ""),
                 clear_first=params.get("clear_first", True),
             )
 
         if action in ("click", "left_click"):
+            if params.get("x") is None or params.get("y") is None:
+                return "Click target is not explicit. Use screen_click with a visible element description or provide x/y after confirmation."
             return _click(params.get("x"), params.get("y"), "left", 1)
 
         if action == "double_click":
+            if params.get("x") is None or params.get("y") is None:
+                return "Double-click target is not explicit. Use screen_click with a visible element description or provide x/y after confirmation."
             return _click(params.get("x"), params.get("y"), "left", 2)
 
         if action == "right_click":
+            if params.get("x") is None or params.get("y") is None:
+                return "Right-click target is not explicit. Use screen_click with a visible element description or provide x/y after confirmation."
             return _click(params.get("x"), params.get("y"), "right", 1)
 
         if action == "move":
@@ -450,20 +474,20 @@ def computer_control(
             return _clipboard_paste(params.get("text", ""))
 
         if action == "screenshot":
-            return _screenshot(params.get("path"))
+            result = _screenshot(params.get("path"))
+            update_task_state(
+                last_successful_action="computer_control:screenshot",
+                last_screen_summary=ctx.get("screen_summary", ""),
+                current_task_context=result,
+            )
+            return result
 
         if action == "screen_find":
             coords = _screen_find(params.get("description", ""))
             return f"{coords[0]},{coords[1]}" if coords else "NOT_FOUND"
 
         if action == "screen_click":
-            desc   = params.get("description", "")
-            coords = _screen_find(desc)
-            if coords:
-                time.sleep(0.2)
-                _click(x=coords[0], y=coords[1])
-                return f"Clicked '{desc}' at {coords}"
-            return f"Element not found on screen: '{desc}'"
+            return safe_click_or_ask(params.get("description", ""), _screen_find)
 
         if action == "wait":
             secs = float(params.get("seconds", 1.0))

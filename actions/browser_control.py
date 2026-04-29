@@ -22,6 +22,8 @@ import subprocess
 import threading
 from pathlib import Path
 from typing import Optional
+from session_state import screen_context_check, should_reuse_current_screen, update_task_state
+from config import get_default_browser
 
 from playwright.async_api import (
     async_playwright,
@@ -367,7 +369,7 @@ def _detect_default_browser() -> str:
                     return kw
     except Exception:
         pass
-    return "chrome"
+    return get_default_browser()
 
 
 # ── Tek tarayıcı oturumu ──────────────────────────────────────────────────────
@@ -879,6 +881,31 @@ def browser_control(
     action  = params.get("action", "").lower().strip()
     browser = params.get("browser", "").lower().strip() or None
     result  = "Unknown action."
+    target_app = browser or get_default_browser()
+    target_page = params.get("url") or params.get("query") or params.get("text") or params.get("description") or ""
+    ctx = screen_context_check(target_app, target_page)
+    risky_text = " ".join(str(params.get(k, "")) for k in ("text", "description", "selector", "url")).lower()
+    if action in {"click", "smart_click", "press"} and any(
+        word in risky_text for word in ("submit", "send", "pay", "purchase", "password", "şifre", "gönder", "ödeme")
+    ):
+        result = "Confirmation required before clicking a potentially risky web control."
+        _log(player, result)
+        return result
+
+    if action in {"go_to", "search", "new_tab"}:
+        reuse, reason = should_reuse_current_screen(target_app, target_page)
+        if reuse and target_page and target_page.lower() in (ctx.get("active_window_title", "").lower()):
+            result = f"Current browser screen already matches request. Reusing it. ({reason})"
+            update_task_state(
+                last_target_app=target_app,
+                last_target_window_title=ctx.get("active_window_title", ""),
+                last_target_contact_or_page=str(target_page),
+                last_successful_action=f"browser_control:{action}:reused",
+                last_screen_summary=ctx.get("screen_summary", ""),
+                current_task_context=result,
+            )
+            _log(player, result)
+            return result
 
     if action == "switch":
         target = browser or params.get("target", "").lower().strip()
@@ -951,6 +978,14 @@ def browser_control(
         result = f"Browser error ({action}): {e}"
 
     _log(player, result)
+    update_task_state(
+        last_target_app=target_app,
+        last_target_window_title=ctx.get("active_window_title", ""),
+        last_target_contact_or_page=str(target_page),
+        last_successful_action=f"browser_control:{action}",
+        last_screen_summary=ctx.get("screen_summary", ""),
+        current_task_context=str(result)[:240],
+    )
     return result
 
 
