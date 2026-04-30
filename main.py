@@ -185,12 +185,15 @@ TOOL_DECLARATIONS = [
             "MUST be called when user asks what is on screen, what you see, "
             "analyze my screen, look at camera, etc. "
             "You have NO visual ability without this tool. "
-            "After calling this tool, stay SILENT — the vision module speaks directly."
+            "After calling this tool, stay SILENT — the vision module speaks directly. "
+            "For OCR-only screen reading and coordinate extraction, use angle='ocr_screen' or mode='ocr'."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "angle": {"type": "STRING", "description": "'screen' to capture display, 'camera' for webcam. Default: 'screen'"},
+                "angle": {"type": "STRING", "description": "'screen' to capture display, 'camera' for webcam, 'ocr_screen' for OCR-based coordinate analysis. Default: 'screen'"},
+                "mode":  {"type": "STRING", "description": "Optional: set 'ocr' to force OCR-only analysis report output."},
+                "monitor_mode": {"type": "STRING", "description": "OCR screenshot monitor mode: 'primary' for the main monitor or 'all' for all monitors. Default: 'primary'."},
                 "text":  {"type": "STRING", "description": "The question or instruction about the captured image"}
             },
             "required": ["text"]

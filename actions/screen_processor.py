@@ -11,6 +11,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
+try:
+    import pytesseract
+    _TESSERACT = True
+except ImportError:
+    _TESSERACT = False
+
 import numpy as np
 import sounddevice as sd
 
@@ -29,6 +35,9 @@ except ImportError:
 
 try:
     import PIL.Image
+    import PIL.ImageEnhance
+    import PIL.ImageFilter
+    import PIL.ImageGrab
     _PIL = True
 except ImportError:
     _PIL = False
@@ -100,6 +109,27 @@ _SCREEN_ANALYSIS_DEFAULT = {
     "risk_level": "unknown",
     "can_continue_current_task": False,
     "reason": "",
+    "ocr_texts": [],
+    "ocr_candidates": [],
+}
+
+_OCR_ANALYSIS_DEFAULT = {
+    "found_texts": [],
+    "possible_input_fields": [],
+    "possible_buttons": [],
+    "possible_titles": [],
+    "notes": "",
+    "raw_text": "",
+    "debug_screenshot_path": "",
+    "processed_screenshot_path": "",
+    "image_size": "",
+    "image_mode": "",
+    "screen_size": "",
+    "screenshot_size": "",
+    "processed_size": "",
+    "monitor_mode": "primary",
+    "image_to_string_text": "",
+    "image_to_data_count": 0,
 }
 
 
@@ -169,6 +199,14 @@ def _capture_screen() -> tuple[bytes, str]:
     return _compress(png, "PNG")
 
 
+def _capture_ocr_screen_image(monitor_mode: str = "primary"):
+    if not _PIL:
+        raise RuntimeError("Pillow is required for OCR screenshot capture.")
+    if monitor_mode == "all":
+        return PIL.ImageGrab.grab(all_screens=True).convert("RGB")
+    return PIL.ImageGrab.grab().convert("RGB")
+
+
 def _extract_json_object(text: str) -> dict:
     text = (text or "").strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
@@ -180,6 +218,282 @@ def _extract_json_object(text: str) -> dict:
         if match:
             return json.loads(match.group(0))
     raise ValueError("Gemini Vision did not return valid JSON.")
+
+
+def _sanitize_for_json_parse(text: str) -> str:
+    text = (text or "").encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    return "".join(ch for ch in text if ch >= " " or ch in "{}[],:\"")
+
+
+def _sanitize_ocr_text(text: str, limit: int = 4000) -> str:
+    text = (text or "").encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = text.replace('"', "").replace("'", "")
+    text = re.sub(r"\s+", " ", text)
+    text = "".join(ch for ch in text if ch >= " ")
+    return text.strip()[:limit]
+
+
+def _safe_list(value, limit: int) -> list:
+    if not isinstance(value, list):
+        return []
+    return [_sanitize_ocr_value(item) for item in value[:limit]]
+
+
+def _sanitize_ocr_value(value):
+    if isinstance(value, str):
+        return _sanitize_ocr_text(value)
+    if isinstance(value, list):
+        return [_sanitize_ocr_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            _sanitize_ocr_text(str(key), limit=120): _sanitize_ocr_value(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _extract_ocr_data(image_source, monitor_mode: str = "primary") -> dict:
+    output = {
+        "texts": [],
+        "raw_text": "",
+        "status": "ok",
+        "reason": "",
+        "debug_screenshot_path": "",
+        "processed_screenshot_path": "",
+        "image_size": "",
+        "image_mode": "",
+        "screen_size": "",
+        "screenshot_size": "",
+        "processed_size": "",
+        "monitor_mode": monitor_mode,
+        "image_to_string_text": "",
+        "image_to_data_count": 0,
+    }
+    if not _PIL:
+        output["status"] = "unavailable"
+        output["reason"] = "Pillow is required for OCR preprocessing."
+        return output
+    if not _TESSERACT:
+        output["status"] = "unavailable"
+        output["reason"] = "pytesseract is not installed."
+        return output
+
+    try:
+        if isinstance(image_source, PIL.Image.Image):
+            img = image_source.convert("RGB")
+        else:
+            img = PIL.Image.open(io.BytesIO(image_source)).convert("RGB")
+        output["image_size"] = f"{img.size[0]}x{img.size[1]}"
+        output["screen_size"] = output["image_size"]
+        output["screenshot_size"] = output["image_size"]
+        output["image_mode"] = img.mode
+
+        debug_path = Path.home() / "Desktop" / "jarvis_ocr_debug.png"
+        processed_path = Path.home() / "Desktop" / "jarvis_ocr_processed.png"
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(debug_path)
+        output["debug_screenshot_path"] = str(debug_path)
+
+        gray = np.asarray(img.convert("L"))
+        mean = float(np.mean(gray))
+        std = float(np.std(gray))
+        notes = [
+            f"monitor_mode={output['monitor_mode']}",
+            f"original_size={output['image_size']}",
+            f"screenshot_size={output['screenshot_size']}",
+            f"screen_size={output['screen_size']}",
+            f"mode={output['image_mode']}",
+            f"mean={mean:.2f}",
+            f"std={std:.2f}",
+        ]
+        if img.size[0] < 1000:
+            notes.append("LOW RES SCREENSHOT")
+        if mean < 5:
+            notes.append("Screenshot appears nearly black.")
+        elif mean > 250:
+            notes.append("Screenshot appears nearly white.")
+        elif std < 3:
+            notes.append("Screenshot appears very low contrast / possibly blank.")
+
+        resampling = getattr(PIL.Image, "Resampling", PIL.Image)
+        processed = img.convert("L")
+        if mean < 80:
+            processed = PIL.ImageEnhance.Contrast(processed).enhance(1.2)
+            processed = processed.filter(PIL.ImageFilter.SHARPEN)
+            notes.append("processed pipeline: grayscale + contrast 1.2 + sharpen + 2x resize.")
+        else:
+            notes.append("processed pipeline: grayscale + 2x resize.")
+        processed = processed.resize((processed.width * 2, processed.height * 2), resampling.BICUBIC)
+        output["processed_size"] = f"{processed.size[0]}x{processed.size[1]}"
+        notes.append(f"processed_size={output['processed_size']}")
+        processed.save(processed_path)
+        output["processed_screenshot_path"] = str(processed_path)
+    except Exception as exc:
+        output["status"] = "error"
+        output["reason"] = str(exc)[:220]
+        return output
+
+    ocr_config = "--oem 3 --psm 6"
+    def run_ocr_pipeline(name: str, ocr_img, scale: float) -> dict:
+        pipeline = {"name": name, "texts": [], "raw_text": "", "data_count": 0, "error": ""}
+        try:
+            pipeline["raw_text"] = _sanitize_ocr_text(pytesseract.image_to_string(ocr_img, config=ocr_config))
+        except Exception as exc:
+            pipeline["error"] = f"image_to_string error: {str(exc)[:180]}"
+
+        try:
+            data = pytesseract.image_to_data(ocr_img, output_type=pytesseract.Output.DICT, config=ocr_config)
+        except Exception as exc:
+            extra = f"image_to_data error: {str(exc)[:180]}"
+            pipeline["error"] = f"{pipeline['error']} {extra}".strip()
+            return pipeline
+
+        pipeline["data_count"] = len(data.get("text", []))
+        for i in range(pipeline["data_count"]):
+            text = (data["text"][i] or "").strip()
+            conf_raw = str(data.get("conf", ["-1"])[i])
+            try:
+                conf = float(conf_raw)
+            except Exception:
+                conf = -1.0
+            if not text or conf < 35:
+                continue
+
+            item = {
+                "text": _sanitize_ocr_text(text[:160]),
+                "x": int(data["left"][i] / scale),
+                "y": int(data["top"][i] / scale),
+                "width": int(data["width"][i] / scale),
+                "height": int(data["height"][i] / scale),
+                "confidence": round(conf, 2),
+            }
+            pipeline["texts"].append(item)
+
+        pipeline["texts"] = pipeline["texts"][:150]
+        if not pipeline["raw_text"]:
+            pipeline["raw_text"] = _sanitize_ocr_text(" ".join(item["text"] for item in pipeline["texts"]))
+        return pipeline
+
+    original_result = run_ocr_pipeline("original", img, 1.0)
+    processed_result = run_ocr_pipeline("processed", processed, 2.0)
+    chosen = max(
+        [original_result, processed_result],
+        key=lambda item: (len(item["texts"]), len(item["raw_text"])),
+    )
+
+    output["texts"] = chosen["texts"]
+    output["raw_text"] = chosen["raw_text"]
+    output["image_to_string_text"] = chosen["raw_text"]
+    output["image_to_data_count"] = chosen["data_count"]
+
+    for pipeline in (original_result, processed_result):
+        if pipeline["error"]:
+            notes.append(f"{pipeline['name']} pipeline {pipeline['error']}")
+        notes.append(
+            f"{pipeline['name']} pipeline chars={len(pipeline['raw_text'])}, boxes={len(pipeline['texts'])}/{pipeline['data_count']}"
+        )
+    notes.append(f"chosen pipeline: {chosen['name']}")
+
+    if output["image_to_string_text"] and not output["texts"]:
+        notes.append("image_to_string found text, but image_to_data produced no confident boxes.")
+    output["reason"] = " ".join(notes)
+    return output
+
+
+def _ocr_item_to_region(item: dict, label: str | None = None) -> dict:
+    return {
+        "label": _sanitize_ocr_text(label or item.get("text", ""), limit=120),
+        "x": int(item.get("x", 0) or 0),
+        "y": int(item.get("y", 0) or 0),
+        "width": int(item.get("width", 0) or 0),
+        "height": int(item.get("height", 0) or 0),
+        "confidence": float(item.get("confidence", 0) or 0),
+    }
+
+
+def _guess_ocr_regions(found_texts: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    input_keywords = {"email", "password", "username", "message", "type", "write", "input"}
+    button_keywords = {
+        "login", "send", "ok", "cancel", "continue", "submit", "next",
+        "back", "yes", "no", "search",
+    }
+
+    possible_input_fields = []
+    possible_buttons = []
+    possible_titles = []
+    confident_items = [
+        item for item in found_texts
+        if float(item.get("confidence", 0) or 0) >= 50
+        and _sanitize_ocr_text(str(item.get("text", "")), limit=120)
+    ]
+    if not confident_items:
+        return possible_input_fields, possible_buttons, possible_titles
+
+    heights = sorted(int(item.get("height", 0) or 0) for item in confident_items)
+    median_height = heights[len(heights) // 2] if heights else 0
+    max_bottom = max(int(item.get("y", 0) or 0) + int(item.get("height", 0) or 0) for item in confident_items)
+    title_y_limit = max(140, int(max_bottom * 0.35))
+
+    for item in found_texts:
+        if float(item.get("confidence", 0) or 0) < 50:
+            continue
+        text = _sanitize_ocr_text(str(item.get("text", "")), limit=120)
+        low = text.lower().strip(" :")
+        if not low:
+            continue
+        words = set(re.findall(r"[a-z0-9@._-]+", low))
+        if len(text) <= 40 and (words & button_keywords):
+            possible_buttons.append(_ocr_item_to_region(item, text))
+            continue
+        if words & input_keywords:
+            possible_input_fields.append(_ocr_item_to_region(item, text.rstrip(":")))
+            continue
+
+        height = int(item.get("height", 0) or 0)
+        y = int(item.get("y", 0) or 0)
+        is_upper_title = text.replace(" ", "").isupper() and len(text) >= 3
+        is_large = height >= max(18, int(median_height * 1.25))
+        if y <= title_y_limit and (is_large or is_upper_title):
+            possible_titles.append(_ocr_item_to_region(item, text))
+
+    return possible_input_fields[:30], possible_buttons[:40], possible_titles[:30]
+
+
+def _apply_raw_text_input_fallback(possible_input_fields: list[dict], found_texts: list[dict], raw_text: str) -> tuple[list[dict], list[str]]:
+    fallback_patterns = {
+        "EMAIL": r"\b(?:e-mail|email|mail)\b",
+        "PASSWORD": r"\bpassword\b",
+        "USERNAME": r"\busername\b",
+        "MESSAGE": r"\bmessage\b",
+    }
+    existing_labels = {
+        _sanitize_ocr_text(str(item.get("label", ""))).lower()
+        for item in possible_input_fields
+    }
+    found_words = {
+        _sanitize_ocr_text(str(item.get("text", ""))).lower()
+        for item in found_texts
+    }
+    notes = []
+    for label, pattern in fallback_patterns.items():
+        label_key = label.lower()
+        if label_key in existing_labels or label_key in found_words:
+            continue
+        if not re.search(pattern, raw_text or "", flags=re.IGNORECASE):
+            continue
+        possible_input_fields.append({
+            "label": label,
+            "x": None,
+            "y": None,
+            "width": None,
+            "height": None,
+            "confidence": None,
+            "source": "raw_text_fallback",
+        })
+        notes.append(f"{label} found in raw_text but no bbox")
+    return possible_input_fields[:30], notes
 
 
 def analyze_screen_once(question: str = "") -> dict:
@@ -198,19 +512,22 @@ def analyze_screen_once(question: str = "") -> dict:
 
     try:
         image_bytes, mime_type = _capture_screen()
+        ocr_data = _extract_ocr_data(image_bytes)
         client = genai.Client(api_key=api_key)
         prompt = (
             "Analyze this desktop screenshot for safe UI automation. "
             "Return ONLY one compact JSON object with exactly these keys: "
             "active_app_guess, visible_page_or_screen, visible_text_summary, "
             "possible_input_fields, possible_buttons, risk_level, "
-            "can_continue_current_task, reason. "
+            "can_continue_current_task, reason, ocr_texts, ocr_candidates. "
             "possible_input_fields and possible_buttons must be arrays of short strings. "
             "risk_level must be one of: low, medium, high, critical, unknown. "
             "Set can_continue_current_task false when the target is unclear, a send/submit/payment/password/account action is visible, "
             "or the screenshot does not provide enough confidence. "
-            "Do not include coordinates. Do not invent hidden UI. "
+            "Use OCR list as authoritative for text positions; Vision is for semantic understanding. "
+            "Do not include click actions; only report analysis. "
         )
+        prompt += " OCR data JSON: " + json.dumps(ocr_data, ensure_ascii=False)[:12000]
         if question:
             prompt += f" User context: {question[:500]}"
 
@@ -231,6 +548,8 @@ def analyze_screen_once(question: str = "") -> dict:
             "risk_level": str(parsed.get("risk_level", "unknown")).lower()[:20],
             "can_continue_current_task": bool(parsed.get("can_continue_current_task", False)),
             "reason": str(parsed.get("reason", ""))[:300],
+            "ocr_texts": list(parsed.get("ocr_texts") or ocr_data.get("texts") or [])[:150],
+            "ocr_candidates": list(parsed.get("ocr_candidates") or ocr_data.get("candidates") or [])[:60],
         })
         _save_screen_analysis_to_state(result)
         return result
@@ -241,7 +560,57 @@ def analyze_screen_once(question: str = "") -> dict:
         else:
             result["visible_text_summary"] = "Screen analysis could not be completed."
             result["reason"] = str(exc)[:300]
+        result["ocr_texts"] = []
+        result["ocr_candidates"] = []
         _save_screen_analysis_to_state(result)
+        return result
+
+
+def analyze_screen_ocr_once(question: str = "", monitor_mode: str = "primary") -> dict:
+    """
+    OCR-first screen analysis:
+    - extracts visible text
+    - estimates text coordinates
+    - guesses likely input/button regions
+    No click/automation is performed here.
+    """
+    result = dict(_OCR_ANALYSIS_DEFAULT)
+
+    try:
+        monitor_mode = (monitor_mode or "primary").strip().lower()
+        if monitor_mode not in {"primary", "all"}:
+            monitor_mode = "primary"
+        screen_image = _capture_ocr_screen_image(monitor_mode=monitor_mode)
+        ocr_data = _extract_ocr_data(screen_image, monitor_mode=monitor_mode)
+        found_texts = _safe_list(ocr_data.get("texts"), 120)
+        possible_input_fields, possible_buttons, possible_titles = _guess_ocr_regions(found_texts)
+
+        text = _sanitize_ocr_text(ocr_data.get("raw_text", ""))
+        possible_input_fields, fallback_notes = _apply_raw_text_input_fallback(possible_input_fields, found_texts, text)
+        print("OCR RAW:", text[:500])
+        notes = _sanitize_ocr_text(" ".join([ocr_data.get("reason", ""), *fallback_notes]), limit=500)
+
+        result.update({
+            "found_texts": found_texts,
+            "possible_input_fields": possible_input_fields,
+            "possible_buttons": possible_buttons,
+            "possible_titles": possible_titles,
+            "notes": notes,
+            "raw_text": text,
+            "debug_screenshot_path": ocr_data.get("debug_screenshot_path", ""),
+            "processed_screenshot_path": ocr_data.get("processed_screenshot_path", ""),
+            "image_size": ocr_data.get("image_size", ""),
+            "image_mode": ocr_data.get("image_mode", ""),
+            "screen_size": ocr_data.get("screen_size", ""),
+            "screenshot_size": ocr_data.get("screenshot_size", ""),
+            "processed_size": ocr_data.get("processed_size", ""),
+            "monitor_mode": ocr_data.get("monitor_mode", monitor_mode),
+            "image_to_string_text": ocr_data.get("image_to_string_text", ""),
+            "image_to_data_count": ocr_data.get("image_to_data_count", 0),
+        })
+        return result
+    except Exception as exc:
+        result["notes"] = _sanitize_ocr_text(str(exc), limit=300)
         return result
 
 
@@ -517,6 +886,14 @@ def screen_process(
     params    = parameters or {}
     user_text = (params.get("text") or params.get("user_text") or "").strip()
     angle     = params.get("angle", "screen").lower().strip()
+    mode      = (params.get("mode") or "").strip().lower()
+    monitor_mode = (params.get("monitor_mode") or "primary").strip().lower()
+
+    if angle in {"ocr", "ocr_screen"} or mode == "ocr":
+        ocr_report = analyze_screen_ocr_once(question=user_text, monitor_mode=monitor_mode)
+        print("[Vision OCR] Analysis report:")
+        print(json.dumps(ocr_report, ensure_ascii=False, indent=2))
+        return True
 
     if get_model_type() != "gemini":
         print("[Vision] Local mode active; Gemini vision call skipped.")
